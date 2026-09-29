@@ -96,7 +96,10 @@ Observed properties of the elementary stream in the inspected exports:
   file do not form a complete picture and are dropped.
 
 `ave2mp4` reads the data in one mebibyte windows rather than whole boxes, so a
-NAL unit that straddles a window boundary is carried over. That is the same
+NAL unit that straddles a window boundary is carried over. Nothing is mapped
+and no box is read whole: a memory mapped file stays resident once it has been
+walked, so the memory a conversion needs would follow the size of the export
+rather than the size of the window. That is the same
 result as joining everything and splitting it afterwards, which is what the
 format description here assumes; `tests/test_ave2mp4.py` checks the two against
 each other for every possible cut point.

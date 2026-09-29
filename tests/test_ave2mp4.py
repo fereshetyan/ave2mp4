@@ -197,8 +197,9 @@ def test_iter_boxes_reads_largesize():
     assert list(ave2mp4.iter_boxes(normal + large)) == [
         (0, 12, b"free"), (12, 20, b"free")]
     # The payload of a large sized box starts after sixteen bytes, not eight.
-    assert ave2mp4.payload_offset(normal, 0) == 8
-    assert ave2mp4.payload_offset(normal + large, 12) == 28
+    assert ave2mp4.box_payload_offset(normal) == 8
+    assert ave2mp4.box_payload_offset(normal + large[0:4]) == 8
+    assert ave2mp4.box_payload_offset(large[0:4]) == 16
 
 
 def test_iter_boxes_rejects_a_truncated_box():

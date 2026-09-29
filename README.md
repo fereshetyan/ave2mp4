@@ -263,12 +263,17 @@ Python 3.14.7 and ffmpeg 8.1.3 on a 13th generation Intel Core i5-1334U
 | `--verify full` (whole conversion) | 7.8 s | 95 MB |
 
 So a conversion of that export takes about half a second end to end with the
-default verification, which is roughly 140 MB of input per second on this
+default verification, which is roughly 130 MB of input per second on this
 machine. These are single measurements on one machine and one file; treat them
-as a reference point, not as a guarantee. The peak memory of the converter
-itself does **not** grow with the size of the export: it is set by the window
-size (1 MiB) and by the interpreter. ffmpeg's own footprint is what you see in
-the last column.
+as a reference point, not as a guarantee.
+
+The peak memory of the converter itself does **not** grow with the size of the
+export. Nothing is mapped and nothing is read whole: the container is walked
+box header by box header, and the video is read in windows of one mebibyte,
+each of which is handed back after it has been split into NAL units. Reading
+an 8.4 MB export costs 3.6 MB and a 201 MB one 5.4 MB. The interpreter is
+about 15 MB of that; ffmpeg's own footprint is what you see in the last
+column of the table.
 
 Disk: the export is read in place, and one temporary copy of the elementary
 stream is written — the same size as the video inside the export. **On Linux

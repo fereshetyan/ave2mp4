@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import errno
 import json
-import mmap
 import os
 import shutil
 import struct
@@ -58,6 +57,11 @@ CODEC_DETECT_BYTES = 1 << 16
 #: good and the codec is reported as ambiguous instead of guessed.
 CODEC_VOTE_MARGIN = 4
 
+#: A recording index box larger than this is not an index.  The real ones are
+#: a few hundred bytes per track per chunk, and this bounds what is read for
+#: one box out of a file that is otherwise untrusted.
+MAX_INDEX_BYTES = 16 << 20
+
 #: A NAL unit larger than this is not plausible, and a stream without any
 #: start code in that many bytes is not an elementary stream at all.  It
 #: bounds the memory the streaming splitter can use on a broken file.
@@ -80,24 +84,27 @@ class AveError(Exception):
 # --------------------------------------------------------------------------
 
 
-def iter_boxes(data, start=0, end=None, allow_to_end=False):
-    """Yield (offset, size, type) tuples of the boxes in ``data[start:end]``.
+def walk_boxes(read, start, end, allow_to_end=False):
+    """Yield (offset, size, type) of the boxes in ``[start, end)``.
+
+    ``read(offset, size)`` has to return that many bytes.  The box list of a
+    multi gigabyte export is walked with it rather than out of a copy of the
+    file, so the memory this needs does not follow the size of the recording.
 
     ``size == 1`` is read as a 64 bit ``largesize``, as ISO-BMFF defines it.
     ``size == 0`` means "until the end of the range"; that is only accepted
     for MP4, where the format allows it, because accepting it for a damaged
     .ave file would silently swallow its tail.
     """
-    if end is None:
-        end = len(data)
     offset = start
     while offset + 8 <= end:
-        size, box_type = struct.unpack_from(">I4s", data, offset)
+        header = read(offset, 16 if offset + 16 <= end else 8)
+        size, box_type = struct.unpack_from(">I4s", header, 0)
         if size == 1:
-            if offset + 16 > end:
+            if len(header) < 16:
                 raise AveError("truncated 64 bit box size at offset %d (type %r)"
                                % (offset, box_type))
-            size = struct.unpack_from(">Q", data, offset + 8)[0]
+            size = struct.unpack_from(">Q", header, 8)[0]
         elif size == 0 and allow_to_end:
             size = end - offset
         if size < 8 or offset + size > end:
@@ -109,16 +116,22 @@ def iter_boxes(data, start=0, end=None, allow_to_end=False):
         offset += size
 
 
-def payload_offset(data, offset):
-    """Where the payload of the box at ``offset`` starts.
+def iter_boxes(data, start=0, end=None, allow_to_end=False):
+    """Yield (offset, size, type) tuples of the boxes in ``data[start:end]``."""
+    def read(offset, size):
+        return bytes(data[offset:offset + size])
 
-    Normally eight bytes in, but a box that uses a 64 bit ``largesize`` has a
-    sixteen byte header, and a ``datp`` box that large does happen on a long
-    recording.
+    return walk_boxes(read, start, len(data) if end is None else end,
+                      allow_to_end)
+
+
+def box_payload_offset(header):
+    """How many bytes the header of a box occupies, from its first 4 bytes.
+
+    Normally eight, but a box that uses a 64 bit ``largesize`` has sixteen,
+    and a ``datp`` box that large does happen on a long recording.
     """
-    if struct.unpack_from(">I", data, offset)[0] == 1:
-        return offset + 16
-    return offset + 8
+    return 16 if struct.unpack_from(">I", header, 0)[0] == 1 else 8
 
 
 def read_varint(buf, pos, end=None):
@@ -1139,40 +1152,28 @@ class AveFile:
     Use this as a context manager, or call :meth:`close`.
     """
 
-    #: Reads larger than this go to the file rather than through the memory
-    #: map, so that a large one cannot leave the mapping resident.
-    _DIRECT_READ_ABOVE = 64 << 10
-
     def __init__(self, path):
         self.path = path
-        self._handle = None
-        self._mapping = None
+        self._reader = None
         self._closed = False
         try:
-            self._handle = open(path, "rb")
+            # Unbuffered, so that a positioned read is one seek and one read
+            # and never has to reconcile with a buffer.  os.pread would say the
+            # same thing, but it does not exist on Windows.
+            self._reader = open(path, "rb", buffering=0)
         except OSError as error:
             raise AveError("cannot read %s: %s" % (path, error.strerror or error))
-        size = os.fstat(self._handle.fileno()).st_size
+        size = os.fstat(self._reader.fileno()).st_size
         if size < 16:
             self.close()
             raise AveError("file is too small to be an Avigilon export")
-        try:
-            # A read only mapping keeps the page cache in charge: the box
-            # headers are read, the megabytes of video payload are not.
-            self._mapping = mmap.mmap(self._handle.fileno(), 0,
-                                      access=mmap.ACCESS_READ)
-            self.data = self._mapping
-        except (ValueError, OSError):
-            # 32 bit builds cannot map a large file, and a few exotic
-            # filesystems refuse; fall back to reading it.
-            self.data = self._handle.read()
-        if self.data[4:8] != b"avfs":
+        self.size = size
+        if self._read(4, 4) != b"avfs":
             self.close()
             raise AveError(
                 "not an Avigilon export: missing 'avfs' signature "
                 "(if this file was renamed, restore the .ave extension)"
             )
-        self.size = size
         self._chunk_header_len = None
         self.tracks = []
         self.secondary_tracks = []
@@ -1181,7 +1182,7 @@ class AveFile:
         self.chunk_tracks = []
         self.indexed = True
         try:
-            self.boxes = list(iter_boxes(self.data))
+            self.boxes = list(walk_boxes(self._read, 0, self.size))
             self._parse()
         except Exception:
             self.close()
@@ -1190,22 +1191,16 @@ class AveFile:
     # -- resource handling ------------------------------------------------
 
     def close(self):
-        """Release the memory map.  Idempotent."""
+        """Close the container.  Idempotent."""
         if self._closed:
             return
         self._closed = True
-        if self._mapping is not None:
+        if self._reader is not None:
             try:
-                self._mapping.close()
-            except (BufferError, ValueError):
-                pass
-            self._mapping = None
-        if self._handle is not None:
-            try:
-                self._handle.close()
+                self._reader.close()
             except OSError:
                 pass
-            self._handle = None
+            self._reader = None
 
     def __enter__(self):
         return self
@@ -1229,7 +1224,7 @@ class AveFile:
         pending = []                     # datp boxes not yet attributed
         for offset, size, box_type in self.boxes:
             if box_type == BOX_DATA:
-                head = payload_offset(self.data, offset)
+                head = offset + box_payload_offset(self._read(offset, 4))
                 data_spans.append((head, size - (head - offset)))
                 pending.append(len(data_spans) - 1)
             elif box_type == BOX_RECORD_INDEX:
@@ -1256,30 +1251,39 @@ class AveFile:
     def _read_index(self, offset, size):
         """Return the track entries of one ``rcfc`` box, in file order."""
         entries = []
-        head = payload_offset(self.data, offset)
-        for inner_off, inner_size, inner_type in iter_boxes(
-            self.data, head, offset + size
+        head = offset + box_payload_offset(self._read(offset, 4))
+        for inner_off, inner_size, inner_type in walk_boxes(
+            self._read, head, offset + size
         ):
             if inner_type != b"tkfc":
                 continue
             header_id = None
             sdat_payload = None
-            inner_head = payload_offset(self.data, inner_off)
-            for leaf_off, leaf_size, leaf_type in iter_boxes(
-                self.data, inner_head, inner_off + inner_size
+            inner_head = inner_off + box_payload_offset(
+                self._read(inner_off, 4))
+            for leaf_off, leaf_size, leaf_type in walk_boxes(
+                self._read, inner_head, inner_off + inner_size
             ):
                 if leaf_type == b"tkfh":
                     # docs/FORMAT.md section 5: the track id is written again
                     # at offset 2 of the 22 byte fixed track header.  It is
                     # only a cross check of the protobuf, never the source of
                     # the value: the layout is observed, not specified.
-                    if leaf_size - (payload_offset(self.data, leaf_off)
-                                    - leaf_off) >= 6:
-                        header_id = struct.unpack_from(">I", self.data,
-                                                       leaf_off + 10)[0]
+                    leaf_head = leaf_off + box_payload_offset(
+                        self._read(leaf_off, 4))
+                    if leaf_off + leaf_size - leaf_head >= 6:
+                        header_id = struct.unpack_from(
+                            ">I", self._read(leaf_off + 10, 4), 0)[0]
                 elif leaf_type == b"sdat":
-                    leaf_head = payload_offset(self.data, leaf_off)
-                    sdat_payload = self.data[leaf_head:leaf_off + leaf_size]
+                    head = leaf_off + box_payload_offset(
+                        self._read(leaf_off, 4))
+                    payload_size = leaf_off + leaf_size - head
+                    if payload_size > MAX_INDEX_BYTES:
+                        raise AveError(
+                            "the recording index holds a %d byte box, which is "
+                            "not an index; the export is not one this tool "
+                            "understands" % payload_size)
+                    sdat_payload = self._read(head, payload_size)
             if sdat_payload is None:
                 continue
             index = parse_index_message(sdat_payload)
@@ -1423,7 +1427,7 @@ class AveFile:
         the size of the recording.
         """
         for offset, size in spans:
-            prefix = bytes(self.data[offset:offset + 8192])
+            prefix = self._read(offset, min(8192, size))
             header = detect_chunk_header([prefix])
             if header is None:
                 return False
@@ -1464,16 +1468,24 @@ class AveFile:
     def _read(self, offset, size):
         """Read ``size`` bytes at ``offset`` out of the container.
 
-        A read this size is the only place where the amount of memory in use
-        would otherwise follow the amount of data, so it goes straight to the
-        file: the caller gets one buffer of ``size`` bytes and nothing else
-        survives it.  Reads smaller than that come out of the memory map, which
-        is what the box walk wants, because the number of boxes bounds the
-        number of pages it can touch.
+        This is the only way anything is read, and it hands back exactly
+        ``size`` bytes, so the memory in use follows the size of the read
+        rather than the size of the export.  Nothing is mapped: a memory
+        mapped file stays resident once it has been walked, and handing those
+        pages back is a hint the kernel is free to ignore, which made the
+        memory of a conversion depend on the machine it ran on.
         """
-        if self._handle is not None and size > self._DIRECT_READ_ABOVE:
-            return os.pread(self._handle.fileno(), size, offset)
-        return bytes(self.data[offset:offset + size])
+        if self._reader is None:
+            raise AveError("the export is closed")
+        if size < 0 or offset < 0 or offset + size > self.size:
+            raise AveError("read of %d bytes at %d is outside the export"
+                           % (size, offset))
+        self._reader.seek(offset)
+        data = self._reader.read(size)
+        if len(data) != size:
+            raise AveError("the export ended after %d of %d bytes at offset %d"
+                           % (len(data), size, offset))
+        return data
 
     def detect_chunk_header(self):
         """Length of the header in front of the stream in every video box.
@@ -1481,8 +1493,8 @@ class AveFile:
         Only the first few kilobytes of each box are read, and they are read
         straight out of the mapping, so this does not copy the recording.
         """
-        prefixes = [self._read(offset, 8192)
-                     for offset, _size in self.video_spans]
+        prefixes = [self._read(offset, min(8192, size))
+                    for offset, size in self.video_spans if size >= 8]
         return detect_chunk_header(prefixes) if prefixes else None
 
     @property
