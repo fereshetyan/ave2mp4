@@ -3,22 +3,32 @@
 [![tests](https://github.com/fereshetyan/ave2mp4/actions/workflows/tests.yml/badge.svg)](https://github.com/fereshetyan/ave2mp4/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macOS-lightgrey.svg)](#requirements)
 [![No re-encoding](https://img.shields.io/badge/video-remuxed%20losslessly-success.svg)](#fidelity)
 
 **Convert Avigilon Unity Export (`.ave`) security footage to MP4 — without
-re-encoding, without Windows, without the Avigilon Player.**
+re-encoding, on any operating system, without the Avigilon Player.**
 
 `.ave` is Avigilon's native export format. There is no online converter for
 it, and the official way to get an MP4 out of an export is to install the
 Avigilon Unity Player — a Windows-only application — open the file and export
-it again. This tool does the same job in one command, on any platform, in
-about a second per hour of footage, because the video inside the container is
-already a plain H.264 stream that only has to be rewrapped.
+it again. This tool does the same job in one command, because the video inside
+the container is already a plain H.264 stream that only has to be rewrapped:
+it runs at roughly 100 MB per second, so a typical export converts in under a
+second.
+
+## Download
+
+**[ave2mp4.exe](https://github.com/fereshetyan/ave2mp4/releases/latest)** is a
+standalone Windows build with ffmpeg inside it. No Python, no ffmpeg, no
+command line: download it, then drag an `.ave` file onto it, or run
+`ave2mp4.exe "recording.ave"`. The console window stays open afterwards so the
+log can be read. On Linux and macOS, use the script below.
 
 ```
 $ ave2mp4 "Avigilon Unity Export-2026-09-29 08.54.07.485 AM.ave"
 Avigilon Unity Export-2026-09-29 08.54.07.485 AM.ave
+  ffmpeg       : /usr/bin/ffmpeg
   codec        : h264
   frame rate   : 4.166666666666667 fps (dominant interval; the index disagrees for some chunks (the last one is usually cut short))
   pictures     : 467 in the stream, 467 in the index
@@ -30,6 +40,7 @@ Avigilon Unity Export-2026-09-29 08.54.07.485 AM.ave
 
 ## Contents
 
+- [Download](#download)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -43,20 +54,28 @@ Avigilon Unity Export-2026-09-29 08.54.07.485 AM.ave
 
 ## Requirements
 
-* **Python 3.8 or newer** — the converter itself has no third-party
-  dependencies, everything else is in the standard library.
-* **ffmpeg** (with `ffprobe`) — used for the final rewrapping. It is a hard
-  requirement; the container parsing is pure Python.
+* **Python 3.8 or newer** — the converter imports nothing outside the standard
+  library.
+* **ffmpeg** — used for the final rewrapping. The standalone Windows build
+  ships its own copy; otherwise it is looked up in this order: `--ffmpeg
+  PATH`, the folder of a frozen build, `PATH`, the
+  [`imageio-ffmpeg`](https://pypi.org/project/imageio-ffmpeg/) wheel, and the
+  usual Windows install locations.
+* **ffprobe** is **optional**. It is only used to print a checked width,
+  height, frame count and duration after the conversion; without it the
+  summary falls back to the numbers from the recording index.
 
 ```bash
-# Fedora
+# Fedora / RHEL
 sudo dnf install ffmpeg
 # Debian / Ubuntu
 sudo apt install ffmpeg
 # macOS
 brew install ffmpeg
-# Windows
+# Windows, then reopen the terminal
 winget install Gyan.FFmpeg
+# or let pip bring a private ffmpeg along with the script
+pip install imageio-ffmpeg
 ```
 
 ## Installation
@@ -64,11 +83,15 @@ winget install Gyan.FFmpeg
 The whole converter is a single file, so pick whatever suits you:
 
 ```bash
+# Windows, no Python and no ffmpeg: download ave2mp4.exe
+#   https://github.com/fereshetyan/ave2mp4/releases/latest
+#   and then:  ave2mp4.exe "Avigilon Unity Export-2026-09-29 08.54.07.485 AM.ave"
+
 # Option 1: clone the repository
 git clone https://github.com/fereshetyan/ave2mp4.git
-~/ave2mp4/ave2mp4.py --help
+python3 ave2mp4/ave2mp4.py --help
 
-# Option 2: copy it into your PATH
+# Option 2: copy it into your PATH (Linux and macOS)
 curl -fsSL https://raw.githubusercontent.com/fereshetyan/ave2mp4/main/ave2mp4.py \
   -o ~/.local/bin/ave2mp4
 chmod +x ~/.local/bin/ave2mp4
@@ -78,7 +101,9 @@ ave2mp4 --help
 ## Usage
 
 ```
-usage: ave2mp4 [-h] [-o DIR] [-f] [-i] [--dump-stream PATH] [-q] [--version] [FILE ...]
+usage: ave2mp4 [-h] [-o DIR] [-f] [-i] [--dump-stream PATH] [-q] [--reencode]
+               [--ffmpeg PATH] [--version]
+               [FILE ...]
 ```
 
 | Task | Command |
@@ -89,6 +114,7 @@ usage: ave2mp4 [-h] [-o DIR] [-f] [-i] [--dump-stream PATH] [-q] [--version] [FI
 | Overwrite existing MP4s | `ave2mp4 *.ave --force` |
 | Inspect without converting | `ave2mp4 --info recording.ave` |
 | Transcode an export that uses B-frames | `ave2mp4 recording.ave --reencode` |
+| Use a specific ffmpeg | `ave2mp4 recording.ave --ffmpeg /opt/ffmpeg/bin/ffmpeg` |
 
 The MP4 is written next to the `.ave` file with the same name, and the `.ave`
 file is never modified. Existing MP4s are **not** overwritten unless you pass
@@ -238,9 +264,57 @@ time; the footage simply is not smooth.
 <details>
 <summary>Does this work on Windows and macOS?</summary>
 
-The container parsing is pure Python and the rest is a call to ffmpeg, so yes —
-as long as ffmpeg is installed. The converter was developed and tested on
-Linux.
+Yes, and the continuous integration runs the whole test suite on
+`windows-latest`, `macos-latest` and Ubuntu — the container parsing is pure
+Python and the rest is a call to ffmpeg. On Windows the easiest route is the
+[standalone `ave2mp4.exe`](#download), which needs neither Python nor ffmpeg.
+
+</details>
+
+<details>
+<summary>Windows says "Windows protected your PC" when I start ave2mp4.exe</summary>
+
+That is SmartScreen complaining about an unsigned executable that few people
+have downloaded yet, not an antivirus finding. Choose *More info* → *Run
+anyway*, or run it from a terminal. If you prefer not to trust a prebuilt
+binary, build it yourself in one command:
+
+```powershell
+pip install pyinstaller imageio-ffmpeg
+python -m PyInstaller --onefile --name ave2mp4 --add-binary "ffmpeg.exe;." ave2mp4.py
+```
+
+</details>
+
+<details>
+<summary>It says "ffmpeg was not found"</summary>
+
+Install it (`winget install Gyan.FFmpeg` on Windows, `brew install ffmpeg` on
+macOS, `apt install ffmpeg` on Debian and Ubuntu) and reopen the terminal, or
+run `pip install imageio-ffmpeg` to get a private copy, or point the program at
+an existing binary with `--ffmpeg PATH`. The standalone Windows `.exe` already
+contains one.
+
+</details>
+
+<details>
+<summary>The exe does not print width, height and frame count</summary>
+
+`ffprobe` is what checks a finished MP4, and the standalone Windows build
+bundles `ffmpeg` only. The conversion is complete either way — in that case
+the summary line reports the frame count and duration promised by the
+recording index and says so.
+
+</details>
+
+<details>
+<summary>Is the conversion slow?</summary>
+
+No, and it does not depend on the resolution: not a single pixel is decoded.
+The work is proportional to the size of the file, at roughly 100 MB per second
+on ordinary hardware — the 57 MB export used for testing converts in about
+half a second, and a multi-gigabyte recording takes tens of seconds, not
+minutes.
 
 </details>
 

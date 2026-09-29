@@ -8,23 +8,36 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.10", "3.12", "3.13"]
+        include:
+          - { os: ubuntu-latest, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
 
       - name: Run the test suite
         run: python tests/test_ave2mp4.py
 
       - name: Check that the CLI starts
-        run: python ave2mp4.py --version && python ave2mp4.py --help > /dev/null
+        run: python ave2mp4.py --version

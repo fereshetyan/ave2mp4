@@ -11,3 +11,5 @@ __pycache__/
 /build/
 /dist/
 *.egg-info/
+# Copied there by the Windows release build so that PyInstaller can bundle it
+/ffmpeg.exe

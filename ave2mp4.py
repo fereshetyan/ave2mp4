@@ -129,29 +129,29 @@ def parse_index_message(payload):
 
 
 def split_nals(stream):
-    """Split an Annex-B stream into [(offset, header_length, nal)]."""
+    """Split an Annex-B stream into [(offset, header_length, nal)].
+
+    ``bytes.find`` does the scanning, so this stays fast on a stream of
+    hundreds of megabytes; a per byte loop in Python does not.
+    """
+    positions = []
+    search_from = 0
+    while True:
+        found = stream.find(b"\x00\x00\x01", search_from)
+        if found < 0:
+            break
+        # ``00 00 00 01`` and ``00 00 01`` are the same start code as far as
+        # the NAL unit is concerned; only the reported header length differs.
+        if found >= 1 and stream[found - 1] == 0:
+            positions.append((found - 1, 4))
+        else:
+            positions.append((found, 3))
+        search_from = found + 3
     nals = []
-    pos = 0
     total = len(stream)
-    start = -1
-    start_len = 0
-    while pos + 3 <= total:
-        if stream[pos] == 0 and stream[pos + 1] == 0:
-            if stream[pos + 2] == 1:
-                if start >= 0:
-                    nals.append((start, start_len, stream[start + start_len:pos]))
-                start, start_len = pos, 3
-                pos += 3
-                continue
-            if pos + 4 <= total and stream[pos + 2] == 0 and stream[pos + 3] == 1:
-                if start >= 0:
-                    nals.append((start, start_len, stream[start + start_len:pos]))
-                start, start_len = pos, 4
-                pos += 4
-                continue
-        pos += 1
-    if start >= 0:
-        nals.append((start, start_len, stream[start + start_len:total]))
+    for index, (start, header_len) in enumerate(positions):
+        end = positions[index + 1][0] if index + 1 < len(positions) else total
+        nals.append((start, header_len, stream[start + header_len:end]))
     return nals
 
 
@@ -531,17 +531,99 @@ def format_timestamp(nanoseconds):
 # --------------------------------------------------------------------------
 
 
-def check_tools():
-    missing = [tool for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
-    if missing:
-        raise AveError(
-            "required program(s) not found in PATH: %s (install ffmpeg)"
-            % ", ".join(missing)
+FFMPEG_HELP = (
+    "ffmpeg was not found. Install it with one of:\n"
+    "  Windows : winget install Gyan.FFmpeg      (then reopen the terminal)\n"
+    "  macOS   : brew install ffmpeg\n"
+    "  Debian  : sudo apt install ffmpeg\n"
+    "  Fedora  : sudo dnf install ffmpeg\n"
+    "or install a private copy with: pip install imageio-ffmpeg\n"
+    "or point this program at an existing binary: --ffmpeg PATH"
+)
+
+
+def _bundled(names):
+    """Files that ship next to a frozen copy of this program."""
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return []
+    return [os.path.join(base, name) for name in names]
+
+
+def _windows_locations(names):
+    """Where a Windows user ends up with ffmpeg after the usual installs."""
+    if os.name != "nt":
+        return []
+    candidates = []
+    for variable in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        root = os.environ.get(variable)
+        if not root:
+            continue
+        for name in names:
+            candidates.append(
+                os.path.join(root, "Microsoft", "WinGet", "Links", name)
+            )
+            candidates.append(os.path.join(root, "chocolatey", "bin", name))
+            candidates.append(os.path.join(root, "ffmpeg", "bin", name))
+    return candidates
+
+
+def _imageio_ffmpeg():
+    """The ffmpeg of the ``imageio-ffmpeg`` wheel, when it is installed."""
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        return None
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _first_existing(candidates):
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def find_ffmpeg(explicit=None):
+    """Locate ffmpeg: explicit path, bundle, PATH, imageio-ffmpeg, Windows."""
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise AveError("no ffmpeg at %s (from --ffmpeg)" % explicit)
+        return explicit
+    names = ("ffmpeg.exe", "ffmpeg") if os.name == "nt" else ("ffmpeg",)
+    found = _first_existing(_bundled(names))
+    if not found:
+        found = shutil.which("ffmpeg")
+    if not found:
+        found = _first_existing([_imageio_ffmpeg()])
+    if not found:
+        found = _first_existing(_windows_locations(names))
+    return found
+
+
+def find_ffprobe(ffmpeg=None):
+    """Locate ffprobe. It is optional: only the closing summary uses it."""
+    names = ("ffprobe.exe", "ffprobe") if os.name == "nt" else ("ffprobe",)
+    found = _first_existing(_bundled(names)) or shutil.which("ffprobe")
+    if not found and ffmpeg:
+        found = _first_existing(
+            os.path.join(os.path.dirname(ffmpeg), name) for name in names
         )
+    return found
+
+
+def require_ffmpeg(explicit=None):
+    ffmpeg = find_ffmpeg(explicit)
+    if not ffmpeg:
+        raise AveError(FFMPEG_HELP)
+    return ffmpeg
 
 
 def convert(path, output=None, force=False, dump_stream=None, verbosity=1,
-            reencode=False):
+            reencode=False, ffmpeg_path=None):
     """Convert a single .ave file; returns the path of the written MP4."""
     def say(message, level=1):
         if verbosity >= level:
@@ -559,7 +641,23 @@ def convert(path, output=None, force=False, dump_stream=None, verbosity=1,
         if track["frames"] and track not in ave.video_chunks()
     ]
 
+    if analysis["has_b_frames"] and not reencode:
+        # ffmpeg has to be told the display order of a reordered stream, and
+        # the raw H.264 demuxer does not derive it: a plain remux shuffles the
+        # pictures.  Never do that silently.  This is decided before ffmpeg is
+        # even looked for, so the complaint is about the real problem.
+        raise AveError(
+            "this export uses B-frames, and copying such a stream without "
+            "its display order would shuffle the pictures. Re-run with "
+            "--reencode to transcode instead (lossy), or report this "
+            "export with the --info output so a lossless path can be added."
+        )
+
+    ffmpeg = require_ffmpeg(ffmpeg_path)
+    ffprobe = find_ffprobe(ffmpeg)
+
     say("%s" % path)
+    say("  ffmpeg       : %s" % ffmpeg)
     say("  codec        : %s" % codec)
     say("  frame rate   : %s fps (%s)" % (float(rate), rate_note))
     say("  pictures     : %d in the stream, %d in the index"
@@ -575,17 +673,6 @@ def convert(path, output=None, force=False, dump_stream=None, verbosity=1,
                 % (track["track_id"], track["frames"]), level=0)
 
     if analysis["has_b_frames"]:
-        # ffmpeg has to be told the display order of a reordered stream, and
-        # the raw H.264 demuxer does not derive it: a plain remux shuffles the
-        # pictures.  Never do that silently.
-        if not reencode:
-            raise AveError(
-                "this export uses B-frames, and copying such a stream without "
-                "its display order would shuffle the pictures. Re-run with "
-                "--reencode to transcode instead (lossy), or report this "
-                "export with the --info output so a lossless path can be "
-                "added."
-            )
         say("  warning      : re-encoding because the export uses B-frames - "
             "the result is no longer bit exact", level=0)
     else:
@@ -623,7 +710,7 @@ def convert(path, output=None, force=False, dump_stream=None, verbosity=1,
             handle.write(usable)
 
         command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-r", "%d/%d" % (rate.numerator, rate.denominator),
             "-f", codec, "-i", elementary,
         ]
@@ -651,17 +738,28 @@ def convert(path, output=None, force=False, dump_stream=None, verbosity=1,
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    say("  written      : %s%s" % (output, describe_output(output, verbosity)))
+    summary = describe_output(output, verbosity, ffprobe)
+    if not summary and verbosity >= 1 and not ffprobe:
+        # Nothing to verify with (the frozen Windows build has no ffprobe),
+        # so at least report what the recording index promised, labelled as
+        # what it is instead of pretending it was checked.
+        summary = "\n                 %d frames, %.2f s (from the index)" % (
+            analysis["pictures"], float(analysis["pictures"] / rate))
+    say("  written      : %s%s" % (output, summary))
     return output
 
 
-def describe_output(path, verbosity=1):
-    """Append a short verification of the produced file."""
-    if verbosity < 1:
+def describe_output(path, verbosity=1, ffprobe=None):
+    """Append a short verification of the produced file.
+
+    Skipped silently when ffprobe is not available: it is convenient, not
+    required, and the frozen Windows build ships without it.
+    """
+    if verbosity < 1 or not ffprobe:
         return ""
     try:
         result = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error", "-select_streams", "v:0",
+            [ffprobe, "-hide_banner", "-v", "error", "-select_streams", "v:0",
              "-count_frames", "-show_entries",
              "stream=width,height,nb_read_frames,duration",
              "-of", "json", path],
@@ -677,7 +775,59 @@ def describe_output(path, verbosity=1):
     )
 
 
+def use_utf8_output():
+    """Do not crash on non-ASCII paths when the output is redirected.
+
+    An interactive Windows console is left alone on purpose: Python already
+    talks to it as UTF-16, and reconfiguring it would garble the output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        isatty = getattr(stream, "isatty", None)
+        if reconfigure is None or (isatty is not None and isatty()):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def pause_if_own_console():
+    """Keep the console window open when a frozen build was double clicked.
+
+    Windows closes the window of a program that owns its console as soon as
+    the program exits, which makes drag and drop useless: the log would be
+    gone before it can be read.  When no shell is attached to the console,
+    the process was started from the Explorer and has to wait.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        attached = (ctypes.c_uint * 4)()
+        if kernel32.GetConsoleProcessList(attached, 4) > 1:
+            return
+    except Exception:
+        return
+    if not sys.stdin.isatty():
+        return
+    try:
+        input("\nPress Enter to close ...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main(argv=None):
+    use_utf8_output()
+    try:
+        return _run(argv)
+    finally:
+        pause_if_own_console()
+
+
+def _run(argv=None):
     parser = argparse.ArgumentParser(
         prog="ave2mp4",
         description="Convert Avigilon Unity Export (.ave) recordings to MP4 "
@@ -700,6 +850,9 @@ def main(argv=None):
     parser.add_argument("--reencode", action="store_true",
                         help="transcode instead of copying (lossy); required "
                              "for exports that use B-frames")
+    parser.add_argument("--ffmpeg", metavar="PATH",
+                        help="ffmpeg binary to use (default: a bundled one if "
+                             "present, otherwise the one in PATH)")
     parser.add_argument("--version", action="version",
                         version="ave2mp4 %s" % __version__)
     args = parser.parse_args(argv)
@@ -717,7 +870,6 @@ def main(argv=None):
             if args.info:
                 print(AveFile(path).describe())
                 continue
-            check_tools()
             output = None
             if args.output_dir:
                 output = os.path.join(
@@ -726,6 +878,7 @@ def main(argv=None):
                 )
             convert(path, output=output, force=args.force,
                     dump_stream=args.dump_stream, reencode=args.reencode,
+                    ffmpeg_path=args.ffmpeg,
                     verbosity=0 if args.quiet else 1)
         except AveError as error:
             print("ave2mp4: %s: %s" % (path, error), file=sys.stderr)

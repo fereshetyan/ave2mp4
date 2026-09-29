@@ -120,6 +120,72 @@ def test_parses_synthetic_index():
 
 
 # --------------------------------------------------------------------------
+# finding ffmpeg
+# --------------------------------------------------------------------------
+
+
+def test_ffmpeg_is_found_and_runs():
+    path = ave2mp4.find_ffmpeg()
+    if not path:
+        raise Skip("ffmpeg is not installed")
+    result = subprocess.run([path, "-version"], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    assert result.returncode == 0, path
+
+
+def test_bundled_ffmpeg_is_preferred():
+    """A frozen build ships its own ffmpeg and must use it, not the PATH."""
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    with tempfile.TemporaryDirectory() as directory:
+        bundled = os.path.join(directory, name)
+        with open(bundled, "wb") as handle:
+            handle.write(b"stand in for a bundled binary")
+        had = hasattr(sys, "_MEIPASS")
+        previous = getattr(sys, "_MEIPASS", None)
+        sys._MEIPASS = directory
+        try:
+            assert ave2mp4.find_ffmpeg() == bundled
+        finally:
+            if had:
+                sys._MEIPASS = previous
+            else:
+                del sys._MEIPASS
+
+
+def test_missing_ffmpeg_explains_how_to_install_it():
+    previous = ave2mp4.find_ffmpeg
+    ave2mp4.find_ffmpeg = lambda explicit=None: None
+    try:
+        try:
+            ave2mp4.require_ffmpeg()
+        except ave2mp4.AveError as error:
+            for hint in ("winget", "brew", "apt", "dnf", "imageio-ffmpeg",
+                         "--ffmpeg"):
+                assert hint in str(error), hint
+        else:
+            raise AssertionError("a missing ffmpeg must be an error")
+    finally:
+        ave2mp4.find_ffmpeg = previous
+
+
+def test_conversion_works_without_ffprobe():
+    """The frozen Windows build has no ffprobe; that must merely skip a line."""
+    require_ffmpeg()
+    with tempfile.TemporaryDirectory() as directory:
+        source = os.path.join(directory, "sample.ave")
+        output = os.path.join(directory, "sample.mp4")
+        make_sample.build(source, chunk_frames=(8,))
+        previous = ave2mp4.find_ffprobe
+        ave2mp4.find_ffprobe = lambda ffmpeg=None: None
+        try:
+            ave2mp4.convert(source, output=output, verbosity=0)
+        finally:
+            ave2mp4.find_ffprobe = previous
+        assert os.path.exists(output)
+        assert probe(output)["frames"] == 8
+
+
+# --------------------------------------------------------------------------
 # end to end
 # --------------------------------------------------------------------------
 
@@ -157,12 +223,16 @@ def test_conversion_is_lossless_for_the_pictures():
         nals = lambda stream: [nal for _o, _h, nal in ave2mp4.split_nals(stream)]  # noqa: E731
         stored = nals(bytes(ave2mp4.AveFile(source).stream))
 
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-v", "error", "-i", output,
-             "-c", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264", "-"],
-            stdout=subprocess.PIPE, check=True,
-        )
-        rewritten = nals(result.stdout)
+        with tempfile.TemporaryDirectory() as scratch:
+            rewritten_path = os.path.join(scratch, "rewritten.h264")
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", output,
+                 "-c", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264",
+                 rewritten_path],
+                check=True,
+            )
+            with open(rewritten_path, "rb") as handle:
+                rewritten = nals(handle.read())
         assert len(rewritten) == len(stored), (len(rewritten), len(stored))
         assert all(a == b for a, b in zip(stored, rewritten))
 
@@ -173,26 +243,37 @@ def tagged_stream(frames=30, bframes=False):
     The average colour of a decoded picture then *is* its number, which makes
     the presentation order of a file directly observable.
     """
-    command = [
-        "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-f", "lavfi", "-i", "color=black:s=64x48:r=25",
-        "-vf", "geq=r='N*8':g='0':b='0'",
-        "-frames:v", str(frames),
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-bf", "2" if bframes else "0", "-g", str(frames),
-        "-f", "h264", "-",
-    ]
-    return subprocess.run(command, stdout=subprocess.PIPE, check=True).stdout
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "tagged.h264")
+        command = [
+            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=black:s=64x48:r=25",
+            "-vf", "geq=r='N*8':g='0':b='0'",
+            "-frames:v", str(frames),
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-bf", "2" if bframes else "0", "-g", str(frames),
+            "-f", "h264", path,
+        ]
+        subprocess.run(command, check=True)
+        with open(path, "rb") as handle:
+            return handle.read()
 
 
 def presentation_order(path):
-    """The picture numbers of a file, in the order a player would show them."""
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-v", "error", "-i", path,
-         "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        stdout=subprocess.PIPE, check=True,
-    )
-    data = result.stdout
+    """The picture numbers of a file, in the order a player would show them.
+
+    The frames are written to a file rather than a pipe: a pipe on Windows
+    translates line endings and would corrupt binary output.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        raw = os.path.join(directory, "order.rgb")
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", path,
+             "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", raw],
+            check=True,
+        )
+        with open(raw, "rb") as handle:
+            data = handle.read()
     return [round(data[index] / 8) for index in range(0, len(data), 3)]
 
 

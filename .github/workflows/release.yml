@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg, PyInstaller and a private ffmpeg
+        run: |
+          choco install ffmpeg -y --no-progress
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller imageio-ffmpeg
+
+      - name: Run the test suite before packaging
+        run: python tests/test_ave2mp4.py
+
+      - name: Build ave2mp4.exe
+        shell: pwsh
+        run: |
+          $ffmpeg = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          Write-Host "bundling $ffmpeg"
+          Copy-Item $ffmpeg ffmpeg.exe
+          python -m PyInstaller --onefile --console --name ave2mp4 `
+            --exclude-module imageio_ffmpeg `
+            --add-binary "ffmpeg.exe;." ave2mp4.py
+          Get-Item dist\ave2mp4.exe | Format-List Name, Length
+
+      - name: Smoke test the packaged binary
+        shell: pwsh
+        run: |
+          # A synthetic export, so the test needs no real footage.
+          python tests/make_sample.py sample.ave 24 8
+
+          $log = & .\dist\ave2mp4.exe sample.ave --force 2>&1 | Out-String
+          Write-Host $log
+
+          if ($LASTEXITCODE -ne 0) { throw "ave2mp4.exe failed with exit code $LASTEXITCODE" }
+          if ($log -notmatch '_MEI') { throw "the bundled ffmpeg was not used" }
+          if (-not (Test-Path sample.mp4)) { throw "no MP4 was produced" }
+
+          $frames = (ffprobe -v error -select_streams v:0 -count_frames `
+            -show_entries stream=nb_read_frames -of csv=p=0 sample.mp4).Trim()
+          if ([int]$frames -ne 32) { throw "expected 32 frames, got '$frames'" }
+          Write-Host "the packaged binary produced $frames frames"
+
+          & .\dist\ave2mp4.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "ave2mp4.exe --version failed" }
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ave2mp4.exe
+          generate_release_notes: true
