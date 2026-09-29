@@ -1,5 +1,6 @@
 # ave2mp4
 
+[![tests](https://github.com/fereshetyan/ave2mp4/actions/workflows/tests.yml/badge.svg)](https://github.com/fereshetyan/ave2mp4/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg)](#requirements)
