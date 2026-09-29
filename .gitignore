@@ -2,7 +2,7 @@
 *.ave
 *.mp4
 *.h264
-*.hevc
+*.h265
 
 # Test artefacts
 __pycache__/

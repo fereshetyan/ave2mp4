@@ -66,9 +66,8 @@ needed for conversion, but it is a good source of provenance information.
 ## 4. `datp` – the video payload
 
 Each `datp` box holds one chunk of a plain **H.264 Annex-B elementary
-stream** (H.265 is expected to work the same way, see §8). The payload starts
-with a 24 byte chunk header that is byte-identical in every chunk of an
-export:
+stream** (H.265 works the same way, see §9). The payload starts with a 24 byte
+chunk header that is byte-identical in every chunk of an export:
 
 ```
 00 00 00 00 00 00 00 01  00 00 00 00 00 00 ff e7  00 00 00 00 00 00 00 00
@@ -95,6 +94,12 @@ Observed properties of the elementary stream in the inspected exports:
   assigns timestamps by packet index instead.
 * An export is cut in the middle of a picture, so the last NAL units of the
   file do not form a complete picture and are dropped.
+
+`ave2mp4` reads the data in one mebibyte windows rather than whole boxes, so a
+NAL unit that straddles a window boundary is carried over. That is the same
+result as joining everything and splitting it afterwards, which is what the
+format description here assumes; `tests/test_ave2mp4.py` checks the two against
+each other for every possible cut point.
 
 ## 5. `rcfc` – the recording index
 
@@ -155,6 +160,32 @@ structure: reading it for the inspected exports gives exactly the key frame
 positions computed from the decoded stream. The other fields look like per
 frame bookkeeping (sizes, hashes, seek tables).
 
+### Which track a `datp` box belongs to
+
+The index behind a `datp` box names the tracks that contributed pictures to
+it, through field 2 of each `tkfc` message. That is the only deterministic
+link between an index entry and the bytes in front of it, and it is what
+`ave2mp4` uses to decide which boxes make up the video:
+
+* exactly one track holds pictures anywhere in the export → that track is the
+  video, and only its boxes are extracted;
+* several tracks hold pictures → each candidate's data is parsed, and the one
+  that really holds an H.264/H.265 Annex-B stream is taken. This is a content
+  test rather than a track number test, because the track numbers come from
+  one Avigilon version. If it does not single a track out, the export is
+  refused: the second track is not silently dropped, and it is not silently
+  mixed into the video either;
+* one chunk names two tracks, or a chunk the index says nothing about → the
+  data cannot be attributed and the export is refused;
+* no track holds pictures at all → there is no index to map the boxes with, so
+  all of them are used and a warning says that is what happened. The frame
+  rate is then unknown and the conversion stops.
+
+The `tkfh` box repeats the track id at offset 2 (see the table above). It is
+read as a cross check of the protobuf and reported by `--info` when the two
+disagree, but the structured protobuf wins: the fixed layout is *observed*,
+not specified.
+
 ## 6. Timing
 
 Frame timing is described only by the index, and it is **constant per chunk**:
@@ -185,29 +216,85 @@ of guessing:
 The resulting NAL units, and therefore the decoded pictures, are identical to
 the export.
 
-## 8. What is not supported
+The converter also refuses, rather than writing something, when the stream
+cannot be read consistently:
+
+* a picture whose slice header cannot be parsed **in the middle** of the
+  recording — everything behind it would be dropped, so the export is reported
+  as damaged. A picture that cannot be parsed at the very end is the normal
+  cut frame of §4 and is simply dropped;
+* a stream that yields noticeably fewer pictures than the recording index
+  claims. A chunk can be cut in the middle of its last picture, so up to one
+  picture per chunk may legitimately be missing; more than that means video
+  went missing and the conversion stops.
+
+## 8. Codec detection
+
+The H.264 and the H.265 NAL unit header spaces overlap, so a header byte on
+its own does not identify the codec: every H.264 slice header `0x41`–`0x45`
+also reads as a valid H.265 VPS, SPS, PPS or AUD header. Treating that as H.265
+used to make the converter throw away most of the video of an H.264 export
+whose first chunk did not start with a parameter set.
+
+`ave2mp4` therefore scores every NAL unit in the head of the stream against
+both codecs, using three independent kinds of evidence:
+
+* **which type space the header byte falls into**, including the types each
+  specification reserves and therefore forbids — a header byte below `0x20`
+  means `nal_ref_idc == 0` in H.264, where only a handful of types are legal,
+  and `0x60`–`0x67` are H.265 reserved types;
+* **whether the NAL unit parses as a parameter set of that codec** — an H.265
+  SPS payload starts with four bits of `sps_video_parameter_set_id` and so
+  begins with a byte of `0x00`–`0x0F`, while an H.264 payload begins with a
+  `profile_idc`, and the lowest defined value is 44;
+* **whether it parses as a slice header of that codec**.
+
+A codec is only accepted when the data gives no support at all to the other
+one, or a clear margin over it. Anything else is reported as ambiguous and the
+export is refused, because the wrong guess truncates the stream. A NAL unit
+that supports neither codec contributes nothing, which is what lets an SEI or
+a filler unit sit in either stream without deciding it.
+
+## 9. What is not supported
 
 * **Password protected exports.** Avigilon can encrypt an export. The bytes
   are then not a readable elementary stream and `ave2mp4` refuses the file
   instead of producing garbage.
-* **Additional tracks.** The inspected exports contain a second track (id
-  `201`) with no frames at all. A non empty second track is reported but not
-  converted; audio would need the same treatment as the video.
+* **Additional tracks with video in them.** The inspected exports contain a
+  second track (id `201`) with no frames at all. A track that does not hold a
+  video stream is reported and not converted; audio would need the same
+  treatment as the video. A track that *does* hold a video stream is reported
+  as a candidate, and if the export has more than one such track the export is
+  refused, because nothing in the container says which one it is about.
 * **Exports with B-frames.** This is a limitation of the converter rather than
   of the format. A reordered stream can only be converted losslessly if the
-  presentation order of every picture is known, and ffmpeg's raw H.264
-  demuxer does not derive it from the bitstream. `ave2mp4` therefore refuses
-  such exports (see the `--reencode` option) instead of writing a file whose
-  pictures are in the wrong order. Parsing the POC from the slice headers, or
-  storing the presentation order while remuxing, would lift the restriction.
-* **H.265 exports.** Avigilon cameras can record H.265. The converter detects
-  the codec and asks ffmpeg for the matching demuxer, but no such export has
-  been available for testing.
+  presentation order of every picture is known, and ffmpeg's raw H.264 and
+  H.265 demuxers do not derive it from the bitstream. `ave2mp4` therefore
+  refuses such exports (see the `--reencode` option) instead of writing a file
+  whose pictures are in the wrong order.
+  * For H.264 the decision comes from the slice type: `slice_type` 1 or 6 is a
+    B slice, and a B slice needs pictures from both directions, which only
+    happens in a reordered stream.
+  * For H.265 the slice type cannot decide it, because H.265 calls both P and B
+    pictures a "B slice" and gives `slice_type` 1 to the rest — libx265 writes
+    1 for a plain P picture and 0 for a B one. The decision comes from the
+    picture order counts instead, read from the slice headers using
+    `log2_max_pic_order_cnt_lsb` from the SPS. A decode order whose counts only
+    ever step forwards is the display order; any other step needs a display
+    order that has to be handed to ffmpeg. If the SPS or the PPS is missing and
+    the counts cannot be read, the order is reported as *unknown* and the
+    export is refused.
+  * Storing the presentation order while remuxing, and writing it into the
+    MP4 as a composition offset, would lift the restriction for both codecs.
+* **H.265 exports.** Avigilon cameras can record H.265. Codec detection,
+  reordering detection, the safe path and the refused path are all covered by
+  the test suite with real libx265 output, but no H.265 export from a recorder
+  has been available for testing.
 * **Variable frame rate.** Only in the sense that a file whose chunks disagree
   about the frame interval falls back to the average interval, which makes
   playback speed approximate.
 
-## 9. Reproducing this analysis
+## 10. Reproducing this analysis
 
 The format is small enough to be explored with a few lines of Python. Dump
 the box list, find a box whose payload starts with `00 00 00 01` or
