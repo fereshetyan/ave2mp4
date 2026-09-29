@@ -1998,7 +1998,14 @@ def validate_output(path, expected_pictures, ffprobe=None, verify=VERIFY_CHEAP):
                 % (required.decode("ascii"),
                    " ".join(t.decode("ascii", "replace") for t in types) or "nothing")
             )
-    if not ffprobe or verify == VERIFY_NONE:
+    if verify == VERIFY_NONE:
+        return None, notes
+    if not ffprobe:
+        # Without ffprobe the picture count cannot be compared, so say so
+        # rather than let a weaker check look like the one that was asked for.
+        notes.append(
+            "no ffprobe found, so the picture count of the result was not "
+            "checked; only that it is a readable MP4")
         return None, notes
 
     count_frames = verify == VERIFY_FULL
@@ -2341,6 +2348,7 @@ def _convert(ave, path, output, force, dump_stream, verbosity, reencode,
         )
         for note in notes:
             say("  note         : %s" % note)
+        del properties
         commit_output(pending_output, output)
         pending_output = None
     except BaseException:

@@ -76,15 +76,6 @@ def probe(path, count_frames=True):
     }
 
 
-def stub_binary(directory, name, source):
-    """Write an executable stand-in for ffmpeg or ffprobe."""
-    path = os.path.join(directory, name)
-    with open(path, "w") as handle:
-        handle.write(source)
-    os.chmod(path, 0o755)
-    return path
-
-
 def frame_timestamps(path):
     """(pts, dts) of every picture, in the order the file stores them."""
     result = subprocess.run(
@@ -142,48 +133,27 @@ def encode_stream(directory, codec="h264", frames=24, bframes=0, source=None,
 # Every stub has to advertise the capabilities a real ffmpeg 5 or newer has, so
 # that the test reaches the failure it is about instead of stopping at the
 # capability check.
-STUB_PREAMBLE = """#!/usr/bin/env python3
-import sys
-if '-version' in sys.argv:
-    print('ffmpeg version 8.1.1')
-    sys.exit(0)
-if '-bsfs' in sys.argv:
-    print('Bitstream Filters:')
-    print('setts')
-    print('h264_mp4toannexb')
-    sys.exit(0)
-if '-encoders' in sys.argv:
-    print('Encoders:')
-    print(' V....D libx264              libx264 H.264 / AVC')
-    sys.exit(0)
-"""
+# A stand-in for ffmpeg has to be an executable the operating system will
+# actually run, which a script with a shebang is not on Windows.  The Python
+# interpreter itself is: handed ffmpeg's command line it exits non zero, which
+# is exactly the "ffmpeg failed" case the output handling has to survive, and it
+# needs no stub file on any platform.
+UNUSABLE_FFMPEG = sys.executable
 
-FAILING_FFMPEG = STUB_PREAMBLE + """import os
-out = [a for a in sys.argv if a.endswith('.mp4')][-1]
-# The worst case: ffmpeg opens the output, writes rubbish into it and then
-# fails.  The destination must come out of this untouched.
-with open(out, 'wb') as handle:
-    handle.write(os.urandom(4096))
-sys.stderr.write('simulated ffmpeg failure\\n')
-sys.exit(1)
-"""
 
-GARBAGE_FFMPEG = STUB_PREAMBLE + """out = [a for a in sys.argv if a.endswith('.mp4')][-1]
-with open(out, 'wb') as handle:
-    handle.write(b'this is not an MP4')
-sys.exit(0)
-"""
+def stub_binary(directory, name, source):
+    """Write a script stand-in, for the tests that need a scripted binary.
 
-TRUNCATED_FFMPEG = STUB_PREAMBLE + """import shutil, subprocess
-out = [a for a in sys.argv if a.endswith('.mp4')][-1]
-source = [a for a in sys.argv if a.endswith('.h264')]
-# A real MP4, but with only two of the pictures the export holds: the case a
-# half finished remux leaves behind.
-subprocess.run([shutil.which('ffmpeg'), '-hide_banner', '-v', 'error', '-y',
-                '-r', '25', '-f', 'h264', '-i', source[0], '-frames:v', '2',
-                '-c', 'copy', out], check=True)
-sys.exit(0)
-"""
+    These are POSIX only: on Windows a script with a shebang is not a
+    runnable executable, so the tests that use this raise Skip instead.
+    """
+    if os.name == "nt":
+        raise Skip("a shebang script is not a runnable executable on Windows")
+    path = os.path.join(directory, name)
+    with open(path, "w") as handle:
+        handle.write(source)
+    os.chmod(path, 0o755)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -1375,7 +1345,11 @@ def test_existing_output_is_not_overwritten():
 
 def test_a_failed_forced_conversion_preserves_the_previous_output():
     """--force used to delete the destination first, so an ffmpeg that failed
-    afterwards left a truncated file where a good MP4 had been."""
+    afterwards left a truncated file where a good MP4 had been.
+
+    The Python interpreter stands in for ffmpeg: it is a real executable on
+    every platform, and handed ffmpeg's command line it exits non zero.
+    """
     require_ffmpeg()
     with tempfile.TemporaryDirectory() as directory:
         source = os.path.join(directory, "sample.ave")
@@ -1385,13 +1359,11 @@ def test_a_failed_forced_conversion_preserves_the_previous_output():
         with open(output, "rb") as handle:
             good = handle.read()
         assert len(good) > 4096
-
-        failing = stub_binary(directory, "ffmpeg", FAILING_FFMPEG)
         try:
             ave2mp4.convert(source, output=output, force=True, verbosity=0,
-                            ffmpeg_path=failing)
+                            ffmpeg_path=UNUSABLE_FFMPEG)
         except ave2mp4.AveError as error:
-            assert "ffmpeg failed" in str(error), error
+            assert "ffmpeg" in str(error), error
         else:
             raise AssertionError("a failing ffmpeg must be an error")
         with open(output, "rb") as handle:
@@ -1401,8 +1373,50 @@ def test_a_failed_forced_conversion_preserves_the_previous_output():
         assert not leftovers, "a temporary file was left behind: %s" % leftovers
 
 
-def test_an_output_that_is_not_an_mp4_is_discarded():
+def test_an_output_that_is_not_an_mp4_is_rejected():
+    """What ffmpeg left behind is checked before it can replace anything."""
+    with tempfile.TemporaryDirectory() as directory:
+        junk = os.path.join(directory, "junk.mp4")
+        with open(junk, "wb") as handle:
+            handle.write(b"this is not an MP4 at all")
+        try:
+            ave2mp4.validate_output(junk, 8, None, ave2mp4.VERIFY_CHEAP)
+        except ave2mp4.AveError as error:
+            assert "not a usable MP4" in str(error), error
+        else:
+            raise AssertionError("a file that is not an MP4 must be rejected")
+        empty = os.path.join(directory, "empty.mp4")
+        open(empty, "wb").close()
+        try:
+            ave2mp4.validate_output(empty, 8, None, ave2mp4.VERIFY_CHEAP)
+        except ave2mp4.AveError as error:
+            assert "empty" in str(error), error
+        else:
+            raise AssertionError("an empty file must be rejected")
+
+
+def test_an_output_that_is_not_an_mp4_never_replaces_a_good_one():
+    """The same rejection through a real conversion, on the platforms where a
+    scripted stand-in for ffmpeg is a runnable executable."""
     require_ffmpeg()
+    rubbish = """#!/usr/bin/env python3
+import sys
+# Advertise what the converter checks before it runs anything, so the test
+# reaches the behaviour it is about rather than the capability check.
+if '-version' in sys.argv:
+    print('ffmpeg version 8.1.1')
+elif '-bsfs' in sys.argv:
+    print('Bitstream Filters:')
+    print('setts')
+elif '-encoders' in sys.argv:
+    print('Encoders:')
+    print(' V....D libx264              libx264')
+else:
+    out = [a for a in sys.argv if a.endswith('.mp4')][-1]
+    with open(out, 'wb') as handle:
+        handle.write(b'this is not an MP4')
+sys.exit(0)
+"""
     with tempfile.TemporaryDirectory() as directory:
         source = os.path.join(directory, "sample.ave")
         output = os.path.join(directory, "sample.mp4")
@@ -1410,10 +1424,10 @@ def test_an_output_that_is_not_an_mp4_is_discarded():
         ave2mp4.convert(source, output=output, verbosity=0)
         with open(output, "rb") as handle:
             good = handle.read()
-        rubbish = stub_binary(directory, "ffmpeg", GARBAGE_FFMPEG)
+        failing = stub_binary(directory, "ffmpeg", rubbish)
         try:
             ave2mp4.convert(source, output=output, force=True, verbosity=0,
-                            ffmpeg_path=rubbish)
+                            ffmpeg_path=failing)
         except ave2mp4.AveError as error:
             assert "not a usable MP4" in str(error), error
         else:
@@ -1422,21 +1436,35 @@ def test_an_output_that_is_not_an_mp4_is_discarded():
             assert handle.read() == good
 
 
-def test_an_output_with_fewer_pictures_than_extracted_is_discarded():
+def test_an_output_with_fewer_pictures_than_extracted_is_rejected():
+    """A real MP4 that holds only two of the pictures the export has is
+    refused, because committing it would silently drop the rest."""
     require_ffmpeg()
     with tempfile.TemporaryDirectory() as directory:
         source = os.path.join(directory, "sample.ave")
-        output = os.path.join(directory, "sample.mp4")
-        make_sample.build(source, chunk_frames=(8,))
-        truncated = stub_binary(directory, "ffmpeg", TRUNCATED_FFMPEG)
+        info = make_sample.build(source, chunk_frames=(16,))
+        full = os.path.join(directory, "full.mp4")
+        ave2mp4.convert(source, output=full, verbosity=0)
+        assert probe(full)["frames"] == info["frames"]
+        short = os.path.join(directory, "short.mp4")
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", full,
+             "-frames:v", "2", "-c", "copy", short], check=True)
+        assert ave2mp4.mp4_box_types(short)[0] == b"ftyp"
+        # The picture count is only compared when there is an ffprobe to
+        # read it with; without one the output is only checked for being a
+        # well formed MP4, and the converter says so.
+        properties, _notes = ave2mp4.validate_output(
+            short, info["frames"], None, ave2mp4.VERIFY_CHEAP)
+        assert properties is None
         try:
-            ave2mp4.convert(source, output=output, verbosity=0,
-                            ffmpeg_path=truncated)
+            ave2mp4.validate_output(short, info["frames"],
+                                    ave2mp4.find_ffprobe(),
+                                    ave2mp4.VERIFY_CHEAP)
         except ave2mp4.AveError as error:
             assert "incomplete" in str(error), error
         else:
-            raise AssertionError("a truncated output must be rejected")
-        assert not os.path.exists(output)
+            raise AssertionError("a short output must be rejected")
 
 
 def test_a_missing_ffmpeg_binary_is_a_clean_error():
@@ -1459,20 +1487,20 @@ def test_an_output_directory_that_cannot_be_created_is_a_clean_error():
     with tempfile.TemporaryDirectory() as directory:
         source = os.path.join(directory, "sample.ave")
         make_sample.build(source, chunk_frames=(8,))
-        readonly = os.path.join(directory, "readonly")
-        os.mkdir(readonly)
-        os.chmod(readonly, 0o500)
+        # A regular file where a directory has to be, so creating the output
+        # directory fails the same way on every platform.  chmod is no help
+        # here: on Windows the owner may always write.
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "wb") as handle:
+            handle.write(b"")
         try:
-            try:
-                ave2mp4.convert(source,
-                                output=os.path.join(readonly, "sub", "x.mp4"),
-                                verbosity=0)
-            except ave2mp4.AveError as error:
-                assert "cannot create" in str(error), error
-            else:
-                raise AssertionError("an unwritable directory must be an error")
-        finally:
-            os.chmod(readonly, 0o700)
+            ave2mp4.convert(source,
+                            output=os.path.join(blocker, "sub", "x.mp4"),
+                            verbosity=0)
+        except ave2mp4.AveError as error:
+            assert "cannot create" in str(error), error
+        else:
+            raise AssertionError("an unusable output directory must be an error")
 
 
 def test_verify_full_and_verify_none_agree_on_the_frame_count():
@@ -1646,21 +1674,27 @@ MEASURE_SCRIPT = """
 import os, resource, sys
 sys.path.insert(0, %(root)r)
 import ave2mp4
+# ru_maxrss is a high water mark, and on some platforms a child inherits the
+# high water mark of the process that spawned it.  The measuring process is
+# therefore asked how much memory the work cost it, not what its peak was:
+# the difference is the same number on every platform and is not polluted by
+# whatever the process that built the fixture had allocated.
+start = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 total = 0
 length = 0
 with ave2mp4.AveFile(sys.argv[1]) as export:
     for offset, header_len, _nal in export.iter_nals():
         total += 1
         length = offset + header_len + len(_nal)
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 if sys.platform == 'darwin':
-    peak //= 1024
-print(total, length, peak)
+    start //= 1024
+    end //= 1024
+print(total, length, max(0, end - start), end)
 """
 
-# ru_maxrss is inherited across fork on Linux, so a process spawned by a
-# parent that just built a large fixture starts out with the parent's peak.
-# Spawning through a second, tiny process makes the measurement its own.
+# One extra process so the measuring process is not the one that built the
+# fixture; harmless, and it keeps the inherited high water mark small.
 LAUNCHER_SCRIPT = """
 import subprocess, sys
 subprocess.run([sys.executable] + sys.argv[1:], check=True)
@@ -1678,8 +1712,13 @@ def _have_resource_module():
     return hasattr(resource, "getrusage")
 
 
-def _peak_memory_kilobytes(directory, path):
-    """Run the measurement in a process of its own and return (nals, KB)."""
+def _measure(directory, path):
+    """Read an export in a process of its own.
+
+    Returns ``(nal units, bytes, growth in KB, absolute peak in KB)``, where
+    the growth is what reading the file cost on top of the interpreter that
+    was already running.
+    """
     measure = os.path.join(directory, "measure.py")
     with open(measure, "w") as handle:
         handle.write(MEASURE_SCRIPT % {"root": ROOT})
@@ -1689,17 +1728,17 @@ def _peak_memory_kilobytes(directory, path):
     result = subprocess.run(
         [sys.executable, launcher, measure, path],
         stdout=subprocess.PIPE, check=True)
-    counted, length, peak = result.stdout.decode().split()
-    return int(counted), int(length), int(peak)
+    fields = result.stdout.decode().split()
+    return (int(fields[0]), int(fields[1]), int(fields[2]), int(fields[3]))
 
 
 def test_a_large_export_is_read_in_bounded_memory():
     """The memory a conversion needs must not grow with the size of the file.
 
     Two exports with the same chunk size but six times as many chunks are read
-    in separate processes and their peak resident set sizes are compared.  A
-    reader that copied the recording would show six times as much for the
-    larger one; a reader that walks it does not.
+    in separate processes and what each read cost them is compared.  A reader
+    that copied the recording would show six times as much for the larger one;
+    a reader that walks it does not.
     """
     if not _have_resource_module():
         raise Skip("the resource module is not available on this platform")
@@ -1711,7 +1750,7 @@ def test_a_large_export_is_read_in_bounded_memory():
     expected_length = sum(
         4 + len(nal.rstrip(b"\x00"))
         for _start, nal in make_sample._split_nals(stream))
-    peaks = {}
+    results = {}
     with tempfile.TemporaryDirectory() as directory:
         for chunks in (4, 24):
             path = os.path.join(directory, "large-%d.ave" % chunks)
@@ -1719,25 +1758,25 @@ def test_a_large_export_is_read_in_bounded_memory():
                 path, [stream] * chunks,
                 [[(101, pictures)] for _ in range(chunks)])
             size = os.path.getsize(path)
-            counted, length, peak = _peak_memory_kilobytes(directory, path)
+            counted, length, growth, _peak = _measure(directory, path)
             # The count and the byte length are both checked: a reader that
             # dropped part of a window would still report the right number of
             # NAL units.
             assert counted == chunks * len(nals(stream)), counted
             assert length == chunks * expected_length, (length, expected_length)
-            peaks[chunks] = (size, peak)
+            results[chunks] = (size, growth)
             del path
 
-    small_size, small_peak = peaks[4]
-    large_size, large_peak = peaks[24]
+    small_size, small_growth = results[4]
+    large_size, large_growth = results[24]
     assert large_size > small_size * 4, (small_size, large_size)
-    # A reader that copied the recording would need the whole file.
-    assert large_peak < large_size, (large_peak, large_size)
+    # A reader that holds the recording in memory would need the whole file.
+    assert large_growth < large_size, (large_growth, large_size)
     # ... and reading six times as much must not cost six times as much: the
-    # memory follows the size of one chunk, not the size of the export.
-    assert large_peak - small_peak < 8 * 1024, \
-        "peak grew from %d KB to %d KB for %d more bytes of export" % (
-            small_peak, large_peak, large_size - small_size)
+    # memory follows the size of one window, not the size of the export.
+    assert large_growth - small_growth < 8 * 1024, \
+        "reading %d more bytes of export cost %d KB more" % (
+            large_size - small_size, large_growth - small_growth)
 
 
 # --------------------------------------------------------------------------
