@@ -1,0 +1,13 @@
+# Avigilon exports and anything derived from them: never commit real footage.
+*.ave
+*.mp4
+*.h264
+*.hevc
+
+# Test artefacts
+__pycache__/
+*.pyc
+.pytest_cache/
+/build/
+/dist/
+*.egg-info/
