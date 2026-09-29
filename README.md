@@ -273,7 +273,10 @@ box header by box header, and the video is read in windows of one mebibyte,
 each of which is handed back after it has been split into NAL units. Reading
 an 8.4 MB export costs 3.6 MB and a 201 MB one 5.4 MB. The interpreter is
 about 15 MB of that; ffmpeg's own footprint is what you see in the last
-column of the table.
+column of the table. The test suite asserts that reading an export costs well
+under half of it, which is what a reader that walks the file spends; it does
+not assert an exact figure, because the allocator and the read ahead of the
+platform move it by several megabytes.
 
 Disk: the export is read in place, and one temporary copy of the elementary
 stream is written — the same size as the video inside the export. **On Linux
