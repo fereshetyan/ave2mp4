@@ -14,8 +14,14 @@ permissions:
 jobs:
   windows-exe:
     runs-on: windows-latest
+    # Job level is the finest granularity GitHub Actions supports: a
+    # permissions key on an individual step is not a valid step key, and a
+    # workflow file containing one is rejected outright.  This is still
+    # tighter than the repository default of granting the workflow
+    # contents: write, because the permission is now scoped to the one job
+    # that needs it.
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -101,8 +107,6 @@ jobs:
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
-        permissions:
-          contents: write
         with:
           files: dist/ave2mp4.exe
           generate_release_notes: true
