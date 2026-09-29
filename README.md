@@ -256,7 +256,7 @@ Python 3.14.7 and ffmpeg 8.1.3 on a 13th generation Intel Core i5-1334U
 
 | Stage | Time | Peak resident memory |
 |---|---|---|
-| Parse and extract the elementary stream | 0.08 s | 23 MB |
+| Parse and extract the elementary stream | 0.09 s | 21 MB |
 | `ffmpeg -c copy` remux | 0.13 s | 74 MB |
 | `--verify none` (whole conversion) | 0.32 s | 74 MB |
 | `--verify cheap` (whole conversion) | 0.40 s | 74 MB |

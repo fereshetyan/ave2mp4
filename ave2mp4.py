@@ -1122,7 +1122,7 @@ def format_seconds(seconds):
 #: windows of this size.  A NAL unit that straddles a window boundary is
 #: carried over, which is what :func:`split_nals_stream` is for, so the window
 #: size changes the memory a conversion needs and nothing else: measured on the
-#: 57.7 MB reference export, parsing and extracting used 23 MB of resident
+#: 57.7 MB reference export, parsing and extracting used 21 MB of resident
 #: memory with a 1 MiB window and 29 MB with an 8 MiB one, for the same wall
 #: clock time.
 MAX_CHUNK_BYTES = 1 << 20
@@ -1131,11 +1131,17 @@ MAX_CHUNK_BYTES = 1 << 20
 class AveFile:
     """A parsed Avigilon Unity Export file.
 
-    The container is never copied into memory: it is memory mapped where the
-    platform allows it, and the video is read one ``datp`` box at a time, so
-    the peak memory of a conversion does not grow with the size of the
-    recording.  Use it as a context manager, or call :meth:`close`.
+    The container is never copied into memory.  The box walk reads through a
+    memory map, where the number of boxes bounds what is touched, and the
+    video itself is read through :meth:`_read`, which for a read of any size
+    goes to the file and hands back one bounded buffer.  The memory a
+    conversion needs therefore does not grow with the size of the recording.
+    Use this as a context manager, or call :meth:`close`.
     """
+
+    #: Reads larger than this go to the file rather than through the memory
+    #: map, so that a large one cannot leave the mapping resident.
+    _DIRECT_READ_ABOVE = 64 << 10
 
     def __init__(self, path):
         self.path = path
@@ -1449,35 +1455,25 @@ class AveFile:
             end_of_box = offset + size
             while position < end_of_box:
                 end = min(position + MAX_CHUNK_BYTES, end_of_box)
-                piece = bytes(self.data[position:end])
+                piece = self._read(position, end - position)
                 if position == offset:
                     piece = piece[header_len:]
                 yield piece
-                self._release(position, end - position)
                 position = end
 
-    def _release(self, offset, size):
-        """Ask the kernel to drop the mapped pages of a range just read.
+    def _read(self, offset, size):
+        """Read ``size`` bytes at ``offset`` out of the container.
 
-        Without this a memory mapped file stays resident once it has been
-        walked, and the peak memory of a conversion ends up being the size of
-        the recording after all - as clean, evictable page cache rather than
-        as anonymous memory, but still as resident pages.  Best effort: where
-        the hint does not exist the pages simply stay, which costs neither
-        speed nor correctness.
+        A read this size is the only place where the amount of memory in use
+        would otherwise follow the amount of data, so it goes straight to the
+        file: the caller gets one buffer of ``size`` bytes and nothing else
+        survives it.  Reads smaller than that come out of the memory map, which
+        is what the box walk wants, because the number of boxes bounds the
+        number of pages it can touch.
         """
-        if self._mapping is None:
-            return
-        advice = getattr(mmap, "MADV_DONTNEED", None)
-        madvise = getattr(self._mapping, "madvise", None)
-        if advice is None or madvise is None:
-            return
-        try:
-            page = mmap.ALLOCATIONGRANULARITY
-            start = offset - offset % page
-            madvise(advice, start, (offset + size) - start)
-        except (OSError, ValueError, OverflowError):
-            pass
+        if self._handle is not None and size > self._DIRECT_READ_ABOVE:
+            return os.pread(self._handle.fileno(), size, offset)
+        return bytes(self.data[offset:offset + size])
 
     def detect_chunk_header(self):
         """Length of the header in front of the stream in every video box.
@@ -1485,7 +1481,7 @@ class AveFile:
         Only the first few kilobytes of each box are read, and they are read
         straight out of the mapping, so this does not copy the recording.
         """
-        prefixes = [bytes(self.data[offset:offset + 8192])
+        prefixes = [self._read(offset, 8192)
                      for offset, _size in self.video_spans]
         return detect_chunk_header(prefixes) if prefixes else None
 
